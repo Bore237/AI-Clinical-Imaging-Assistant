@@ -1,27 +1,86 @@
 """
-Deep Learning Classification Pipeline Orchestrator.
+Description:
+    Orchestration layer managing the end-to-end training, validation, and inference 
+    lifecycles of medical image classification models. This engine wraps Hugging Face's 
+    Accelerate library to enable seamless mixed-precision and distributed environment executions.
 
-This module provides the central execution pipeline for training, evaluating, and deploying 
-deep learning image classification models. It abstracts the complexities of distributed 
-computing, automated mixed precision (AMP), and telemetry tracking by integrating 
-Hugging Face's ``accelerate`` engine and Weights & Biases (WandB).
+Main components :
 
-Pipeline Component Relationships:
-    1. **Configuration Management**: Parses system-wide parameters via ``ConfigurationManager``.
-    2. **Execution Strategy**: Resolves hardware acceleration and optimization loops via ``TrainerManager``.
-    3. **Distributed Runtime**: Leverages ``Accelerator`` to orchestrate data parallel execution across multi-GPU/CPU clusters.
-    4. **Telemetry Instrumentation**: Hooks tracking mechanisms onto model nodes for gradient and performance metric logging.
+    * ClsPipeline.__init__: Configuration parser and dataset stream allocator.
+    * ClsPipeline.train: High-throughput multi-epoch deep learning optimization executor.
+    * ClsPipeline.predict: Memory-safe evaluation and logit extraction matrix generator.
 
-Requirements:
-    Sphinx extension `sphinx.ext.napoleon` must be enabled in `conf.py` to parse
-    the Google-style docstrings used throughout this module.
+Main features :
+
+    * Automatic Mixed Precision (AMP) native selection matching target runtime profiles.
+    * Hugging Face Accelerate abstraction decoupling training mechanics from hardware structures.
+    * Dynamic classification head channel binding synchronized with metadata class counts.
+    * Multi-callback architectural pipeline (Early Stopping, Evaluation, MLOps logging).
+
+General architecture :
+    Encapsulates orchestration logic by parsing inputs through configuration managers, 
+    setting up operational accelerators, routing telemetry to Weights & Biases (W&B), 
+    and passing downstream control loops to a centralized ModelTrainer.
+
+General data flow :
+
+    .. code-block:: text 
+
+        [Config Path] ---> ConfigurationManager ---> Extract Hyperparameters
+                                                            |
+                                                            v
+        [DataLoader]  ---> Accelerator (AMP/DDP) <--- ClassifierModel
+                                     |
+                                     v
+                       ModelTrainer (Callbacks Loop) ---> Weights & Biases / Checkpoints
+
+Optimisations :
+
+    * Device-agnostic tensor allocation switching to evaluation state (.eval()) during inference.
+    * Context-managed memory safety via torch.no_grad() preventing backpropagation memory leaks.
+    * Primary-process isolation (is_main_process) for intensive MLOps tracing hooks (wandb.watch).
+
+Example:
+
+    .. code-block:: python
+
+        from pathlib import Path
+        import torch
+        from src.pipelines.classification.cls_pipeline import ClsPipeline
+
+        pipeline = ClsPipeline(config_path="configs/spine_classification.yaml")
+        
+        # Run training loop
+        pipeline.train()
+
+        # Run out-of-sample inference
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logits, targets = pipeline.predict(device=device, checkpoint_path="models/best_model.pth")
+
+Note:
+    Ensure that when executing in a distributed data-parallel environment, trackers are 
+    initialized globally across all nodes while heavy gradient visualization hooks remain 
+    bound solely to the master node.
+
+References:
+
+    * Hugging Face Accelerate Engine: https://huggingface.co/docs/accelerate
+    * Weights & Biases ML Experiment Tracking: https://docs.wandb.ai/
+
+Author:
+    Goudjou Borel
+
+Version:
+    1.0.0
 """
 
 import torch
 from pathlib import Path
-from typing import Union
+from tqdm.auto import tqdm
 from accelerate import Accelerator
-from src.constants import CONFIG_FILE_PATH
+from typing import Union, Tuple, Optional
+
+from src.configs import CONFIG_FILE_PATH
 from src.callbacks.callbacks import EarlyStoppingCbk
 from src.components.model_trainer import ModelTrainer
 from src.callbacks.cls_callback import EvaluationCbk, LogMetricsCbk
@@ -66,10 +125,11 @@ class ClsPipeline:
         control to the core structural ``ModelTrainer``.
 
         Note:
+
             * Gradient tracking hooks via ``wandb.watch`` are safely executed exclusively 
-            on the main driver process (rank 0 node) to avoid tracking redundancy.
+              on the main driver process (rank 0 node) to avoid tracking redundancy.
             * Early stopping, evaluation metrics, and disk telemetry logs are handled 
-            via modular callbacks injected directly into the execution loop.
+              via modular callbacks injected directly into the execution loop.
 
         Raises:
             ValueError: If configurations are incompatible or hardware assignment fails.
@@ -142,23 +202,92 @@ class ClsPipeline:
         # Run multi-epoch model optimization and performance valuation phases
         trainer.train(train_loader=train_loader, valid_loader=valid_loader)
 
-    def predict(self, device: torch.device) -> None:
-        """Executes inference predictions against targeted out-of-sample data points.
+    def predict(
+        self, 
+        device: torch.device, 
+        dataloader: Optional[torch.utils.data.DataLoader] = None,
+        checkpoint_path: Optional[Union[str, Path]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Executes inference predictions against targeted out-of-sample data points.
 
-        This method routes validation or production targets through the optimized model state 
-        to compute probabilities or discrete class boundaries.
+        This method routes evaluation or production targets through the optimized model state 
+        to compute raw network output logits. It handles activation mappings and tensor shifts 
+        across processing devices safely without leaking GPU memory.
+
+        Mathematical Output Space:
+            Depending on the configuration of your classification head, predictions :math:`\hat{y}` 
+            are returned as unnormalized logit scores. Downstream consumers can apply activation 
+            mappings to compute formal probabilities:
+
+            * For Binary / Multi-label Tasks: :math:`P(y_i = 1 | x) = \sigma(\hat{y}_i)`
+            * For Multiclass Tasks: :math:`P(y = c | x) = \text{softmax}(\hat{y}_c)`
 
         Args:
             device (torch.device): Compute target hardware infrastructure routing the inference 
                 calculations (e.g., ``torch.device('cuda')`` or ``torch.device('cpu')``).
+            dataloader (torch.utils.data.DataLoader, optional): Explicit data stream pipeline 
+                to evaluate. If None, dynamically resolves the validation streaming channel 
+                from the training manager. Defaults to None.
+            checkpoint_path (Union[str, Path], optional): Specific filesystem path to a serialized 
+                ``.pt`` or ``.pth`` model state dictionary checkpoint to load before inference. 
+                Defaults to None.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing two aggregated tensor payloads:
+            
+                * **all_predictions** (torch.Tensor): Continuous unnormalized network logits mapped 
+                  over the entire dataset dimensions.
+                * **all_targets** (torch.Tensor): Core ground truth target arrays if present in the 
+                  stream context, otherwise returns an empty tensor layer.
 
         Example:
             >>> import torch
             >>> pipeline = ClsPipeline(config_path="config.yaml")
             >>> target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            >>> pipeline.predict(device=target_device)
+            >>> logits, targets = pipeline.predict(device=target_device, checkpoint_path="best_model.pth")
         """
-        pass
+        model_config = self.config_manager.get_model_config()
+        model_config.num_classes = self.train_manager.number_class
+        
+        # Instantiate and map the computational architecture onto the target execution hardware
+        model = ClassifierModel(model_config)
+        
+        if checkpoint_path is not None:
+            state_dict = torch.load(Path(checkpoint_path), map_location=device)
+            if "model" in state_dict:
+                state_dict = state_dict["model"]
+            model.load_state_dict(state_dict)
+            
+        model = model.to(device)
+        model.eval()
+
+        if dataloader is None:
+            _, dataloader = self.train_manager.get_dataloaders()
+
+        all_predictions = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Running Pipeline Inference", unit="batch"):
+                if isinstance(batch, dict):
+                    inputs = batch["image"].to(device)
+                    targets = batch.get("label", None)
+                else:
+                    inputs, targets = batch[0].to(device), batch[1]
+
+                outputs = model(inputs)
+                
+                all_predictions.append(outputs.cpu())
+                if targets is not None:
+                    if isinstance(targets, torch.Tensor):
+                        all_targets.append(targets.cpu())
+                    else:
+                        all_targets.append(torch.tensor(targets).cpu())
+
+        all_predictions = torch.cat(all_predictions, dim=0)
+        all_targets = torch.cat(all_targets, dim=0) if all_targets else torch.empty(0)
+
+        return all_predictions, all_targets
 
 
 if __name__ == "__main__":
