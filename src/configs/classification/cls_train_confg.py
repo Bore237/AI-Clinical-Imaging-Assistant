@@ -1,3 +1,108 @@
+"""
+Description:
+    This module implements the training orchestrator component for deep learning classification pipelines. 
+    It serves as a centralized factory class (`TrainerManager`) that dynamically parses system configurations, 
+    resolves dataset split transformations, balances class distributions via weighted loss modules, 
+    and instantiates optimization schedules and performance metrics for both multiclass and multilabel 
+    experimental setups.
+
+Main components :
+
+    * TrainerManager: The primary factory engine responsible for constructing and assembling isolated 
+      PyTorch components required by down-stream training loops.
+    * ClsDataIngestion: Discovers raw file structures, handles metadata schemas, and extracts analytical 
+      class balancing coefficients.
+    * ClsDataTransformation: Builds MONAI-augmented training and validation dataset arrays with 
+      high-performance caching.
+    * MetricCollection: Aggregates evaluation metrics (Accuracy, F1-Score, Recall) into a single 
+      optimized execution container.
+
+Main features :
+
+    * Reflection-Driven Instantiation: Dynamically resolves optimizer and learning rate scheduler classes 
+      directly from the `torch.optim` registry using text-based configuration signatures.
+    * Duality Optimization: Seamlessly toggles execution flows between Multiclass categorical networks 
+      (Softmax dependent) and Multilabel tracking arrays (Sigmoid dependent).
+    * Composite Scheduling: Automatically structures multi-stage training profiles by prepending 
+      linear warmup cycles before traditional learning rate decay milestones.
+    * Automatic Imbalance Compensation: Injects inverse frequency tensors into cross-entropy calculations 
+      and positive weights into binary formulations to stabilize models running on unaligned datasets.
+
+General architecture :
+
+    The class functions as a structural mediator between the system configuration registry (`ConfigurationManager`) 
+    and the actual execution trainer runtime loops. It pulls properties from the data ingestion layer to build 
+    decoupled runtime resources:
+    [Configuration Context] ➔ TrainerManager ➔ [Loss, Optimizers, Schedulers, Metrics, DataLoaders]
+
+General data flow :
+
+    .. code-block:: text 
+
+        ┌────────────────────────────────────────────────────────┐
+        │                  ConfigurationManager                  │
+        └───────────────────────────┬────────────────────────────┘
+                                    │ Provides configuration & metadata
+                                    ▼
+        ┌────────────────────────────────────────────────────────┐
+        │                     TrainerManager                     │
+        └───────┬───────────────┬───────────────┬───────────────┘
+                │               │               │               │
+                ▼               ▼               ▼               ▼
+          [DataLoaders]    [Optimizer]     [Scheduler]   [Loss & Metrics]
+          (Train & Val)   (Dynamic AdamW) (Warmup + LR)  (Macro Average)
+
+Optimisations :
+
+    * Automatic adjustment of scheduler limits (:math:`T_{max}`) to match real remaining steps, preventing 
+      epoch overflow conditions when custom warmup boundaries are explicitly set.
+    * Macro-averaging applied across all metric criteria to guarantee minority classes contribute 
+      equally to calculated validation accuracy scores.
+    * Injected label smoothing (:math:`0.1`) on multiclass arrangements to constrain logit values, preventing 
+      overfitting and improving out-of-distribution robustness.
+
+Example:
+
+    .. code-block:: python
+
+        from src.configs.classification.cls_config import ConfigurationManager
+        from src.components.classification.trainer_manager import TrainerManager
+
+        # Initialize global configuration workspace context
+        config_mgr = ConfigurationManager(config_filepath="path/to/config.yaml")
+
+        # Instantiate the training manager factory engine
+        manager = TrainerManager(config_manager=config_mgr)
+
+        # Resolve isolated PyTorch modules ready for training loops
+        criterion, task_type = manager.get_loss()
+        optimizer = manager.get_optimizer(model.parameters())
+        scheduler = manager.get_scheduler(optimizer)
+        metrics = manager.get_evaluation_metrics()
+        train_loader, val_loader = manager.get_dataloaders()
+
+Note:
+    When setting up composite schedulers with linear warmup, the adjustments to internal parameters like 
+    :math:`T_{max}` are calculated automatically using the relationship:
+
+    .. math::
+        
+        \text{T_max}_{\text{adjusted}} = \text{T_max} - \text{warmup_epochs}
+
+    This calculation relies on raw values provided within the scheduler parameter blocks.
+
+References:
+    * PyTorch Optimization Registry: https://pytorch.org/docs/stable/optim.html
+    * TorchMetrics Classification Suite: https://torchmetrics.readthedocs.io/
+    * Google Python Documentation Style Guide: https://google.github.io/styleguide/pyguide.html
+
+Author:
+    Goudjou Borel
+
+Version:
+    1.0.0
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,10 +114,10 @@ from torchmetrics.classification import (
     MulticlassF1Score,
     MultilabelAccuracy,
     MultilabelF1Score,
+    MulticlassRecall,
+    MultilabelRecall,
 )
 from typing import Any, Tuple, Iterable
-
-from src.constants import *
 from src.components.classification.cls_data_ingestion import ClsDataIngestion
 from src.components.classification.cls_data_transform import ClsDataTransformation
 from src.configs.classification.cls_config import ConfigurationManager
@@ -22,25 +127,28 @@ class TrainerManager:
     """A factory engine that builds and configures PyTorch components for training loops.
 
     Consolidates dataset orchestration, loss function selection, optimization routines,
-    learning rate scheduling setups, and evaluation metrics for both multiclass 
-    and multilabel contexts.
+    learning rate scheduling setups, and evaluation metrics for both multiclass and multilabel contexts.
 
     Attributes:
-        config_manager (ConfigurationManager): System configuration context provider.
-        config (Any): Reference profile mapping structural parameters.
-        data_ingestion (Any): Parsed ingestion ruleset configurations.
-        multiclass (bool): If True, configures standard multiclass behaviors; 
-            if False, switches to a multilabel processing pipeline.
-        img_files (list): Collection of discovered image file references.
-        labels (list): Target ground-truth matrices matching raw assets.
-        weights (dict): Class frequency mappings used to offset data imbalances.
-        pos_weights (list): Positive class weights specifically utilized in multilabel setups.
-        number_class (int): The explicit total number of target classes.
-        class_label (dict): Key-value lookup dictionary mapping labels to integer indices.
+        config_manager (ConfigurationManager): System configuration context provider managing pipeline metadata access.
+        config (Any): Global configuration profile mapping structural parameters across modules.
+        data_ingestion (Any): Resolved ingestion data object housing file source properties.
+        multiclass (bool): If True, configures standard multiclass behaviors (softmax-dependent); 
+            if False, switches to a multilabel processing pipeline (sigmoid-dependent).
+        img_files (list): Collection of discovered absolute or relative image file references.
+        labels (list): Target ground-truth matrices or integer indices matching raw assets.
+        weights (dict): Class frequency mappings used to calculate balancing parameters.
+        pos_weights (list): Positive class weight coefficients utilized in multilabel cross-entropy calculations.
+        number_class (int): The explicit total number of uniquely identified target classes inferred from data.
+        class_label (dict): Key-value lookup dictionary mapping textual labels to clean integer indices.
     """
 
     def __init__(self, config_manager: ConfigurationManager) -> None:
-        """Initializes dependencies and prepares structural metadata from ingested datasets."""
+        """Initializes dependencies and prepares structural metadata from ingested datasets.
+
+        Args:
+            config_manager (ConfigurationManager): The active global workspace configuration manager.
+        """
         self.config_manager = config_manager
         self.config = config_manager.config
         self.data_ingestion = config_manager.get_data_ingestion_config()
@@ -59,9 +167,17 @@ class TrainerManager:
     def get_loss(self) -> Tuple[nn.Module, str]:
         """Resolves the objective loss function based on the active classification style.
 
+        For Multiclass targets, builds an instance of ``nn.CrossEntropyLoss`` integrated 
+        with a categorical tensor tracking inverse frequencies and an explicit label smoothing 
+        factor (:math:`0.1`) to prevent overconfident boundary updates. For Multilabel targets, 
+        builds an instance of ``nn.BCEWithLogitsLoss`` embedding custom calculated positive 
+        class multipliers to balance unaligned label distributions.
+
         Returns:
-            Tuple[nn.Module, str]: The un-placed loss module instance along with a 
-                string label identifying the pipeline profile type ("multiclass" or "multilabel").
+            Tuple[nn.Module, str]: A tuple containing:
+
+                * **loss** (*nn.Module*): The un-placed loss module ready for deployment to devices.
+                * **cls_type** (*str*): Identification signature tracking the pipeline configuration (``"multiclass"`` or ``"multilabel"``).
         """
         if self.multiclass:
             weight_tensor = torch.tensor(list(self.weights.values()), dtype=torch.float32)
@@ -77,11 +193,15 @@ class TrainerManager:
     def get_optimizer(self, model_parameters: Iterable[nn.Parameter]) -> optim.Optimizer:
         """Constructs the optimization engine using the configuration hyperparameters.
 
+        Inspects the runtime configuration context using reflection to identify the matching 
+        PyTorch optimization implementation class, unpacking its associated custom parameter blocks.
+
         Args:
-            model_parameters (Iterable[nn.Parameter]): Target parameter tensors requiring gradients.
+            model_parameters (Iterable[nn.Parameter]): Target parameter tensors requiring 
+                gradient tracking updates within the training loop.
 
         Returns:
-            optim.Optimizer: Fully initialized PyTorch optimization engine.
+            optim.Optimizer: A fully initialized PyTorch optimization engine (e.g., ``optim.AdamW``).
         """
         opt_config = self.config_manager.get_optimizer_config() 
         opt_class = getattr(optim, opt_config.name)
@@ -89,13 +209,25 @@ class TrainerManager:
         return opt_class(params=model_parameters, **opt_config.optimizer_params)
 
     def get_scheduler(self, optimizer: optim.Optimizer) -> Any:
-        """Constructs the learning rate scheduler pipeline, incorporating optional warmup logic.
+        r"""Constructs the learning rate scheduler pipeline, incorporating optional warmup logic.
+
+        If a warmup interval greater than zero is specified, this method constructs a composite 
+        ``lr_scheduler.SequentialLR`` pipeline. It prepends a linear growth cycle rising from :math:`0.0`
+        up to the initial learning rate limit, shifts the tracking timeline constraints of the 
+        main structural policy to protect total epoch bounds via:
+        
+        .. math::
+        
+            \text{T_max}_{\text{adjusted}} = \text{T_max} - \text{warmup_epochs}
+        
+        and transitions across milestones smoothly.
 
         Args:
             optimizer (optim.Optimizer): The active optimization instance bound to the network parameters.
 
         Returns:
-            Any: A standard PyTorch learning rate scheduler or a composite SequentialLR instance.
+            Any: A standard isolated PyTorch learning rate scheduler or a composite 
+            ``lr_scheduler.SequentialLR`` structural pipeline container.
         """
         sched_config = self.config_manager.get_scheduler_config() 
         sched_class = getattr(lr_scheduler, sched_config.name)
@@ -122,25 +254,40 @@ class TrainerManager:
     def get_evaluation_metrics(self) -> MetricCollection:
         """Constructs classification metrics tailored to the dataset execution mode.
 
+        Bundles performance trackers into an integrated ``MetricCollection`` container. 
+        All tracking metrics are assigned a macro-averaging structure, computing statistics 
+        independently per target feature channel before taking an unweighted mean. This prevents 
+        frequent baseline categories from artificially masking low validation accuracies in minority classes.
+
         Returns:
-            MetricCollection: A grouped container of TorchMetrics objects tracking accuracy and F1 scores.
+            MetricCollection: A grouped collection of isolated TorchMetrics tracking 
+            Accuracy, Macro F1-Score, and Macro Recall.
         """
         if self.multiclass:
             return MetricCollection({
                 "accuracy": MulticlassAccuracy(num_classes=self.number_class, average="macro"),
-                "f1_macro": MulticlassF1Score(num_classes=self.number_class, average="macro")
+                "f1_macro": MulticlassF1Score(num_classes=self.number_class, average="macro"),
+                "recal_macro": MulticlassRecall(num_classes=self.number_class, average="macro")
             })
         else:
             return MetricCollection({
                 "accuracy": MultilabelAccuracy(num_labels=self.number_class, average="macro"),
-                "f1_macro": MultilabelF1Score(num_labels=self.number_class, average="macro")
+                "f1_macro": MultilabelF1Score(num_labels=self.number_class, average="macro"),
+                "recal_macro": MultilabelRecall(num_labels=self.number_class, average="macro")
             })
 
     def get_dataloaders(self) -> Tuple[DataLoader, DataLoader]:
         """Runs image transforms and wraps target datasets in ready-to-stream PyTorch DataLoaders.
 
+        Triggers data pipeline conversions via ``ClsDataTransformation``, building memory-cached, 
+        augmented training and validation datasets. These datasets are then encapsulated in standard 
+        PyTorch DataLoaders using the multi-processing and memory-pinning configurations defined 
+        in the structural loader properties.
+
         Returns:
-            Tuple[DataLoader, DataLoader]: Prepared training and validation DataLoader objects.
+            Tuple[DataLoader, DataLoader]: A tuple containing:
+                * **train_loader** (*DataLoader*): The active streaming training DataLoader with shuffling enabled.
+                * **valid_loader** (*DataLoader*): The active evaluation validation DataLoader with shuffling disabled.
         """
         cls_data_transformation = ClsDataTransformation(
             self.config_manager.get_data_transformation_config(), self.multiclass
