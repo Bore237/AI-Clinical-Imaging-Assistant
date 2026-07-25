@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from monai.utils import set_determinism
 
-from src.constants import CONFIG_FILE_PATH
+from src.configs import CONFIG_FILE_PATH
 from src.pipelines.cls_pipeline import ClsPipeline
 from src.utils.logger import get_logger
 
