@@ -5,10 +5,12 @@ Description:
     These modules are designed for safety, precision, and numerical stability.
 
 Main components :
+
     * MultiLabelFocalLoss: Focal Loss for multi-label classification tasks.
     * MultiClassFocalLoss: Focal Loss for multi-class classification tasks.
 
 Main features :
+
     * Dynamic sample-level loss modulation based on prediction difficulty.
     * Uncoupled label smoothing execution preventing target masking during focal factor extraction.
     * Fully vectorized parallel matrix operations for minimal execution overhead.
@@ -18,6 +20,7 @@ General architecture :
     leveraging high-performance underlying ATen/CUDA tensor operations via PyTorch functional API.
 
 General data flow :
+
     .. code-block:: text
 
         [MultiLabel Data Flow]
@@ -62,6 +65,7 @@ Note:
     label noise (e.g., inter-observer variability in clinical annotations) is present.
 
 References:
+
     * Lin, T. Y., Goyal, P., Girshick, R., He, K., & Dollár, P. (2017). Focal loss for dense 
       object detection. In Proceedings of the IEEE international conference on computer vision.
     * Mukhoti, J., Kulharia, V., Sanyal, A., Golodetz, S., Torr, P., & Dokania, P. (2020). 
@@ -89,9 +93,9 @@ class MultiLabelFocalLoss(nn.Module):
 
     Mathematical Definition:
 
-    .. math::
+        .. math::
 
-        FL(p_t) = -\alpha_t (1 - p_t)^{\gamma} \log(p_t)
+            FL(p_t) = -\alpha_t (1 - p_t)^{\gamma} \log(p_t)
 
         Where :math:`p_t` is computed as:
 
@@ -177,7 +181,7 @@ class MultiClassFocalLoss(nn.Module):
         
         .. math::
         
-            (p_t) = -(1 - p_t)^{\\gamma} \\log(p_t)
+            (p_t) = -(1 - p_t)^{\gamma} \log(p_t)
 
         Where :math:`p_t` is extracted via index gathering matching the ground-truth categorical label:
         

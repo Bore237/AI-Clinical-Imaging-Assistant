@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 # On remonte jusqu'à la racine du projet

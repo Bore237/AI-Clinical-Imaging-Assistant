@@ -251,12 +251,16 @@ class EarlyStoppingCbk(Callback):
         *   **Minimization Objective (e.g., loss)**:
             An improvement is declared if and only if the current validation score satisfies:
             
-            $$S_{\text{current}} < S_{\text{best}} - \Delta_{\text{min}}$$
+            .. math::
+
+                S_{\text{current}} < S_{\text{best}} - \Delta_{\text{min}}
             
         *   **Maximization Objective (e.g., accuracy, AUC)**:
             An improvement is declared if and only if the current validation score satisfies:
             
-            $$S_{\text{current}} > S_{\text{best}} + \Delta_{\text{min}}$$
+            .. math::
+
+                S_{\text{current}} > S_{\text{best}} + \Delta_{\text{min}}
 
     Attributes:
         patience (int): Number of consecutive epochs to wait without reaching a new performance 

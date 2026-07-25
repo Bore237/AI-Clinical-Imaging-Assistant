@@ -1,4 +1,4 @@
-"""
+r"""
 Description:
     This module implements the training orchestrator component for deep learning classification pipelines. 
     It serves as a centralized factory class (`TrainerManager`) that dynamically parses system configurations, 
@@ -83,11 +83,11 @@ Example:
 
 Note:
     When setting up composite schedulers with linear warmup, the adjustments to internal parameters like 
-    :math:`T_{max}` are calculated automatically using the relationship:
+    :math:`T_{\text{max}}` are calculated automatically using the relationship:
 
     .. math::
         
-        \text{T_max}_{\text{adjusted}} = \text{T_max} - \text{warmup_epochs}
+        T_{\text{max, adjusted}} = T_{\text{max}} - \text{warmup\_epochs}
 
     This calculation relies on raw values provided within the scheduler parameter blocks.
 
@@ -215,10 +215,10 @@ class TrainerManager:
         ``lr_scheduler.SequentialLR`` pipeline. It prepends a linear growth cycle rising from :math:`0.0`
         up to the initial learning rate limit, shifts the tracking timeline constraints of the 
         main structural policy to protect total epoch bounds via:
-        
+    
         .. math::
-        
-            \text{T_max}_{\text{adjusted}} = \text{T_max} - \text{warmup_epochs}
+
+            T_{\text{max, adjusted}} = T_{\text{max}} - \text{warmup\_epochs}
         
         and transitions across milestones smoothly.
 
@@ -286,6 +286,7 @@ class TrainerManager:
 
         Returns:
             Tuple[DataLoader, DataLoader]: A tuple containing:
+
                 * **train_loader** (*DataLoader*): The active streaming training DataLoader with shuffling enabled.
                 * **valid_loader** (*DataLoader*): The active evaluation validation DataLoader with shuffling disabled.
         """
