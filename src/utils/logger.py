@@ -1,28 +1,67 @@
 """
-Runtime Logging Configuration Subsystem.
+Description:
+    Centralized logging utility designed to manage runtime diagnostics, application tracing,
+    and concurrent file/stream logging output orchestration across an entire software ecosystem.
 
-This module establishes the global logging framework for the entire application suite.
-Upon initial module import, it programmatically configures the root logger with a unified 
-format strategy and provisions dual output pipelines targeting both the active interactive 
-terminal session and a persistent disk log matrix.
+Main components :
 
-Key Architecture Features:
-    * **Global Initialization Override**: Invokes ``logging.basicConfig`` with ``force=True`` 
-    to explicitly flush and reset any pre-existing root logger configurations established by third-party modules during startup.
-    * **Dual Stream Aggregation**: Multiplexes runtime events simultaneously to the console 
-    (via standard output stream) and an operational tracking file.
-    * **Hierarchical Namespace Routing**: Provides factory accessors to inherit parent 
-    stream properties while isolating subsystem identities.
+    * get_logger: Factory function to retrieve or instantiate named module-level loggers.
 
-Module Global Parameters:
-    LOG_FORMAT (str): Structural layout template enforcing the tracking syntax:
-        ``[Timestamp: SeverityLevel: ModuleName: Message]``
-    LOG_DIR (str): Filesystem path referencing the directory container for log archives.
-    LOG_FILEPATH (str): Concrete destination path for writing the persistent log stream.
+Main features :
 
-Requirements:
-    Sphinx extension `sphinx.ext.napoleon` must be enabled in `conf.py` to parse
-    the Google-style docstrings used throughout this module.
+    * Automatic runtime generation of local log directories.
+    * Dual-routing pipeline streaming records concurrently to disk files and standard output.
+    * Forced root logger synchronization to override competing external package configurations.
+
+General architecture :
+    Statically configures the root logger at module load time utilizing Python's native 
+    built-in logging framework, establishing a parent channel that child namespaces inherit.
+
+General data flow :
+
+    .. code-block:: text
+
+        [Application Event] ---> Subsystem Logger (Child Namespace)
+                                           |
+                                           v
+                                  [Root Logger Stack]
+                                           |
+                    +----------------------+----------------------+
+                    |                                             |
+                    v                                             v
+        [FileHandler: running_logs.log]               [StreamHandler: sys.stdout]
+
+Optimisations :
+
+    * Idempotent directory tree generation execution (`os.makedirs` with `exist_ok=True`) 
+      to eliminate OS-level IO validation overhead.
+    * Atomic runtime synchronization with `force=True` parameter to bypass distributed 
+      package configuration deadlocks during sub-module import cycles.
+
+Example:
+
+    .. code-block:: python
+
+        from src.utils.logger import get_logger
+
+        logger = get_logger(__name__)
+        logger.info("Operational pipeline successfully online.")
+
+Note:
+    The file handler appends operational records continuously. For long-running server 
+    environments or intensive training pipelines, consider migrating to a rotating 
+    file handler structure to balance disk constraints.
+
+References:
+
+    * PEP 282 -- A Logging System: https://peps.python.org/pep-0282/
+    * Python Logging Documentation: https://docs.python.org/3/library/logging.html
+
+Author:
+    Goudjou Borel
+
+Version:
+    1.0.0
 """
 
 import os
@@ -53,22 +92,25 @@ logging.basicConfig(
 def get_logger(name: str) -> logging.Logger:
     """Retrieves or instantiates a named Logger instance bound to a specific runtime namespace.
 
-    This factory method provides modules with access to the pre-configured logging 
-    pipeline. By using the standard dot-separated module path (typically via ``__name__``), 
-    loggers inherit the global root properties while retaining granular diagnostic 
+    This factory method provides modules with instant access to the pre-configured logging
+    pipeline. By using the standard dot-separated module path (typically via ``__name__``),
+    loggers inherit the global root properties while retaining granular diagnostic
     isolation for filtering and trace attribution.
 
     Args:
-        name (str): The unique structural namespace identifier for the logger instance, 
+        name (str): The unique structural namespace identifier for the logger instance,
             typically initialized using the calling module's ``__name__`` context variable.
 
     Returns:
-        logging.Logger: A configured and active logger instance mapped to the requested 
+        logging.Logger: A configured and active logger instance mapped to the requested
         subsystem pipeline channel.
 
     Example:
-        >>> from src.utils.logger import get_logger
-        >>> logger = get_logger(__name__)
-        >>> logger.info("Subsystem successfully initialized.")
+    
+        .. code-block:: python
+
+            from src.utils.logger import get_logger
+            logger = get_logger(__name__)
+            logger.info("Subsystem successfully initialized.")
     """
     return logging.getLogger(name)
