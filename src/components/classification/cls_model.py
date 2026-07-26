@@ -1,3 +1,99 @@
+"""
+Description:
+    Ce module implémente la classe centrale de modélisation (`ClassifierModel`) pour les 
+    architectures de classification deep learning. Il encapsule l'instanciation dynamique 
+    de backbones de pointe (ex: EfficientNet, RegNet, DenseNet) via la bibliothèque `timm` 
+    et propose un basculement transparent entre la tête linéaire native du modèle et une 
+    tête de classification perceptron multicouche (MLP) personnalisée.
+
+Main components:
+
+    * ClassifierModel: Wrapper PyTorch (`nn.Module`) unifiant l'extraction de caractéristiques 
+      et les projections linéaires adaptées aux configurations d'imagerie.
+
+Main features:
+
+    * Intégration Native timm: Chargement dynamique de modèles pré-entraînés ou non, avec configuration 
+      séparée du Stochastic Depth (drop path) et du Dropout classique.
+    * Tête MLP Optionnelle: Génération automatique d'un bloc de projection robuste composé de couches 
+      `Linear`, `LayerNorm`, `ReLU` et `Dropout` pour affiner les représentations complexes.
+    * Gestion Flexible des Canaux: Configuration explicite des canaux d'entrée (`in_chans`), idéale 
+      pour traiter des radiographies ou volumes spécifiques.
+
+General architecture:
+    Le modèle agit comme un conteneur modulaire. Si une dimension de tête (`feature_head`) est spécifiée, 
+    la tête native de `timm` est désactivée via `num_classes=0` pour ne renvoyer que le vecteur de caractéristiques 
+    global, qui est ensuite injecté dans la séquence personnalisée :
+    [Tenseur d'Image Input] ➔ timm Encoder ➔ [Tête Custom MLP / Tête Native] ➔ [Logits de Classification]
+
+General data flow:
+
+    .. code-block:: text
+
+        ┌─────────────────────────┐
+        │   Input (B, C, H, W)    │
+        └────────────┬────────────┘
+                     │
+                     ▼
+        ┌─────────────────────────┐
+        │      timm Encoder       │
+        └──────┬───────────┬──────┘
+               │           │
+               │ (feature_head is None)
+               │           │ ───➔ [Native Linear Head] ───➔ Logits (B, Classes)
+               ▼
+         Features (B, Hidden)
+               │
+               ▼
+         [Dropout Layer]
+               │
+               ▼
+         [Custom MLP Head] ➔ Linear ➔ LayerNorm ➔ ReLU ➔ Dropout ➔ Linear ➔ Logits (B, Classes)
+
+Optimisations:
+
+    * Extraction Efficace: L'utilisation de `num_classes=0` dans `timm` court-circuite la création de la couche 
+      linéaire par défaut, économisant des ressources mémoire et du calcul inutile.
+    * Normalisation des Caractéristiques: L'inclusion d'une couche `LayerNorm` au sein de la tête personnalisée 
+      stabilise la distribution des activations et accélère la convergence des gradients sur les cibles 
+      médicales hautement résolues.
+
+Example:
+
+    .. code-block:: python
+
+        from src.entity.cls_entity import ClsModelConfig
+        from src.models.classification import ClassifierModel
+
+        config = ClsModelConfig(
+            model_name="efficientnet_b0",
+            pretrained=True,
+            in_chans=1,
+            num_classes=3,
+            dropout_rate=(0.2, 0.3),
+            feature_head=512,
+            uuid_tag="a1b2c3"
+        )
+        model = ClassifierModel(config_model=config)
+        outputs = model(dummy_tensor)
+
+Note:
+    Lors du passage à `num_classes=0`, la plupart des architectures de `timm` appliquent automatiquement 
+    leur pooling global par défaut (ex: Global Average Pooling) pour renvoyer un tenseur 2D de forme `[B, Features]`. 
+    Assure-toi que le backbone choisi respecte cette propriété sous peine de devoir aplatir manuellement le tenseur.
+
+References:
+
+    * Ross Wightman PyTorch Image Models (timm): https://github.com/huggingface/pytorch-image-models
+    * Google Python Style Guide: https://google.github.io/styleguide/pyguide.html
+
+Author:
+    Goudjou Borel
+
+Version:
+    1.0.0
+"""
+
 from typing import cast
 import torch
 import torch.nn as nn

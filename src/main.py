@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from monai.utils import set_determinism
 
-from src.constants import CONFIG_FILE_PATH
+from src.configs import CONFIG_FILE_PATH
 from src.pipelines.cls_pipeline import ClsPipeline
 from src.utils.logger import get_logger
 
@@ -44,11 +44,14 @@ def main() -> None:
     2. `predict` : Runs automated out-of-sample batch inference pipelines.
 
     Usage:
-        # Launch training using a specific experimental configuration blueprint
-        python main.py train --config config/exp_v1.yaml --device cuda:0
 
-        # Execute batch inference processing on raw DICOM volumes
-        python main.py predict --input "/data/raw" --output "/data/processed" --tolerance 1.5
+        .. code-block:: bash
+
+            # Launch training using a specific experimental configuration blueprint
+            python main.py train --config config/exp_v1.yaml --device cuda:0
+
+            # Execute batch inference processing on raw DICOM volumes
+            python main.py predict --input "/data/raw" --output "/data/processed" --tolerance 1.5
 
     Raises:
         Exception: Catches and logs top-level execution crashes to prevent silent pipeline failures in production automation workers.
