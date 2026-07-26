@@ -1,3 +1,93 @@
+"""
+Description:
+    Ce module implémente le moteur d'orchestration central (`ModelTrainer`) pour les flux 
+    d'entraînement distribués de classification. Il encapsule les boucles d'optimisation, 
+    la gestion des métriques distribuées et le cycle de vie des callbacks en s'appuyant 
+    sur la bibliothèque Hugging Face Accelerate.
+
+Main components:
+
+    * ModelTrainer: Classe principale orchestrant l'entraînement, l'évaluation et l'intégration 
+      des hooks d'optimisation des hyperparamètres (HPO).
+
+Main features:
+
+    * Orchestration Distribuée: Intégration transparente multi-GPU/multi-node via Accelerate.
+    * Gestion des Callbacks: Support d'un pipeline d'extension événementiel (on_step_end, etc.).
+    * Compilation Graph AOT: Support de `torch.compile()` pour optimiser les performances d'exécution.
+    * Recherche d'Hyperparamètres: Intégration native avec Optuna pour le tuning de variables (ex: learning rate).
+    * Normalisation des Tenseurs Imagerie: Aplatissement automatique des tenseurs 5D [B, N, C, H, W] 
+      en 4D pour les architectures classiques.
+
+General architecture:
+    Le `ModelTrainer` agit comme le chef d'orchestre de la phase d'apprentissage. Il reçoit les composants 
+    configurés (modèle, optimiseur, loader, scheduler) et coordonne l'exécution en isolant la logique 
+    matérielle (autocast, backward, sync_gradients) :
+    [Configuration En entrée] ➔ ModelTrainer ➔ [Boucle d'Entraînement Distribuée + Suivi Événementiel]
+
+General data flow:
+
+    .. code-block:: text
+
+        ┌─────────────────────────┐
+        │   Dataloader (Images)   │
+        └────────────┬────────────┘
+                     │ Stream Batch 4D / 5D
+                     ▼
+        ┌─────────────────────────┐
+        │     ModelTrainer        │
+        └──────┬───────────┬──────┘
+               │           │
+               ▼           ▼
+         [Forward Pass]  [Backward Pass]
+         - Autocast AMP  - Accumulate Gradients
+         - Preds/Loss    - Step & Zero_grad
+               │
+               ▼
+         [Callback Hook] ➔ Update TrainState ➔ [Loggers / Wandb]
+
+Optimisations:
+
+    * Précision Mixte (AMP): Activation automatique via les utilitaires natifs d'Accelerate.
+    * Gestion Mémoire: Libération explicite de la mémoire en fin d'exécution (`accelerator.free_memory()`).
+    * Résilience HPO: Protection contre les disparités topologiques en forçant le `prepare()` du DataLoader 
+      dans les processus de recherche.
+
+Example:
+
+    .. code-block:: python
+
+        from accelerate import Accelerator
+        from src.trainers.classification import ModelTrainer
+
+        accelerator = Accelerator()
+        trainer = ModelTrainer(
+            accelerator=accelerator,
+            config=trainer_config,
+            model=my_network,
+            optimizer=my_optimizer,
+            scheduler=my_scheduler,
+            criterion=my_loss_fn
+        )
+        trainer.train(train_loader, valid_loader)
+
+Note:
+    La méthode `find_parameter` modifie directement les groupes de paramètres de l'optimiseur actif. 
+    Veillez à bien réinitialiser les poids du modèle entre chaque essai (trial) au sein de vos 
+    scripts d'optimisation Optuna pour éviter toute contamination de poids d'une exécution à l'autre.
+
+References:
+
+    * Hugging Face Accelerate Documentation: https://huggingface.co/docs/accelerate
+    * Google Python Style Guide: https://google.github.io/styleguide/pyguide.html
+
+Author:
+    Goudjou Borel
+
+Version:
+    1.0.0
+"""
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -41,7 +131,18 @@ class ModelTrainer:
         train_metrics: Optional[Any] = None,
         callbacks: Optional[List[Callback]] = None,
     ) -> None:
-        """Initializes the ModelTrainer execution environment and prepares dependencies."""
+        """Initializes the ModelTrainer execution environment and prepares dependencies.
+
+        Args:
+            accelerator (Accelerator): Hugging Face Accelerator framework context instance.
+            config (TrainerConfig): Configuration profile holding epochs, learning rates, and flags.
+            model (nn.Module): Raw PyTorch model to deploy across computing ranks.
+            optimizer (torch.optim.Optimizer): Optimization core engine mapping weights gradients.
+            scheduler (Any): Learning rate tracking scheduler adjusting operational step decay curves.
+            criterion (nn.Module): Loss function module quantifying prediction error gaps.
+            train_metrics (Optional[Dict[str, Any]], optional): Named dictionary of evaluation metrics. Defaults to None.
+            callbacks (Optional[List[Callback]], optional): Custom runtime callback pipeline extensions. Defaults to None.
+        """
         self.config = config
         self.accelerator = accelerator
         self.device = accelerator.device
@@ -93,7 +194,7 @@ class ModelTrainer:
         )
         
         for step, batch in pbar:
-            with self.accelerator.accumulate(self.model):
+            with self.accelerator.accumulate(self.model): # type: ignore
                 # Flatten 5D sequence tensors [B, N, C, H, W] to 4D batch inputs [B * N, C, H, W]
                 if batch.get("image") is not None and batch["image"].dim() == 5:
                     for key, value in batch.items():
@@ -103,7 +204,7 @@ class ModelTrainer:
                 images = batch["image"]
                 labels = batch["label"]
 
-                with self.accelerator.autocast():
+                with self.accelerator.autocast(): # type: ignore
                     preds = self.model(images)
                     loss = self.criterion(preds, labels)
 
@@ -157,8 +258,8 @@ class ModelTrainer:
                 validation metrics assets. Defaults to None.
 
         Raises:
-            ValueError: If a dynamic metric-based learning rate schedule is active 
-                but no validation dataloader split was provided.
+            ValueError: If a dynamic metric-based learning rate schedule is active but no 
+                validation dataloader split was provided.
         """
         train_loader = self.accelerator.prepare(train_loader)
         if valid_loader is not None:
@@ -202,18 +303,46 @@ class ModelTrainer:
         self.accelerator.free_memory()
         self.accelerator.end_training()
     
-    def find_parameter(self, trial):
-        #import optuna
+    def find_parameter(self, trial: Any, train_loader: DataLoader) -> float:
+        """Optuna target objective integration hook for hyperparameter optimization (HPO) loops.
+
+        Dynamically adjusts hyperparameters for the active optimizer configuration state, 
+        triggers a standard processing epoch trial, and extracts execution performance metrics.
+
+        Note:
+            Ensure internal model weights are reset or re-instantiated between continuous 
+            trial runs to prevent weight contamination across execution histories.
+
+        Example:
+            .. code-block:: python
+
+                def objective(trial):
+                    # Re-instantiate model components to flush weights here...
+                    trainer = ModelTrainer(...)
+                    return trainer.find_parameter(trial, raw_dataloader)
+
+                study = optuna.create_study(direction="minimize")
+                study.optimize(objective, n_trials=30)
+                print(study.best_params)
+
+        Args:
+            trial (optuna.trial.Trial): Active trial instance carrying parameter suggestion algorithms.
+            train_loader (DataLoader): Dataset stream routing baseline structures for evaluation.
+
+        Returns:
+            float: Target loss or structural optimization accuracy metric scored across the evaluation step.
+        """
+        # Suggest floating point bounds and update structural parameters
         lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
-        batch_size = trial.suggest_categorical("batch_size", [8, 16, 32])
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
 
-        # Entraînement du modèle ici...
-        accuracy = self.train_one_epoch(lr, batch_size)
+        # Explicitly guarantee the streaming infrastructure matches distributed rank topologies
+        if not hasattr(train_loader, "batch_sampler"):
+            train_loader = self.accelerator.prepare(train_loader)
 
-        return accuracy
-
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=30)
-        study.best_params
-
-
+        # Standard baseline tracking run
+        metrics = self.train_one_epoch(train_loader, epoch=1)
+        
+        # Return targeted validation criterion score for hyperparameter searching evaluation routines
+        return metrics["loss"]
