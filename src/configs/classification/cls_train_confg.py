@@ -121,6 +121,7 @@ from typing import Any, Tuple, Iterable
 from src.components.classification.cls_data_ingestion import ClsDataIngestion
 from src.components.classification.cls_data_transform import ClsDataTransformation
 from src.configs.classification.cls_config import ConfigurationManager
+from src.utils.cls_losses import MultiClassFocalLoss, MultiLabelFocalLoss
 
 
 class TrainerManager:
@@ -165,27 +166,32 @@ class TrainerManager:
         self.class_label = {k: idx for idx, k in enumerate(self.weights.keys())}
 
     def get_loss(self) -> Tuple[nn.Module, str]:
-        """Resolves the objective loss function based on the active classification style.
+        """Create the focal loss function for the current classification task.
 
-        For Multiclass targets, builds an instance of ``nn.CrossEntropyLoss`` integrated 
-        with a categorical tensor tracking inverse frequencies and an explicit label smoothing 
-        factor (:math:`0.1`) to prevent overconfident boundary updates. For Multilabel targets, 
-        builds an instance of ``nn.BCEWithLogitsLoss`` embedding custom calculated positive 
-        class multipliers to balance unaligned label distributions.
+        Returns either a ``MultiClassFocalLoss`` or a ``MultiLabelFocalLoss``
+        depending on whether the task is multiclass or multilabel. Optional
+        class and positive class weights are applied according to the
+        configuration.
 
         Returns:
             Tuple[nn.Module, str]: A tuple containing:
 
-                * **loss** (*nn.Module*): The un-placed loss module ready for deployment to devices.
-                * **cls_type** (*str*): Identification signature tracking the pipeline configuration (``"multiclass"`` or ``"multilabel"``).
+                * **loss** (*nn.Module*): Instantiated ``MultiClassFocalLoss`` or
+                ``MultiLabelFocalLoss``.
+                * **cls_type** (*str*): Classification type, either
+                ``"multiclass"`` or ``"multilabel"``.
         """
+        config = self.config_manager.get_loss_config()
+
+        weight_tensor = (torch.tensor(list(self.weights.values()), dtype=torch.float32) if config.class_weight else None)
+
+        pos_weight_tensor = (torch.tensor(self.pos_weights, dtype=torch.float32) if config.pos_weight  else None)
+
         if self.multiclass:
-            weight_tensor = torch.tensor(list(self.weights.values()), dtype=torch.float32)
-            loss = nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=0.1)
+            loss = MultiClassFocalLoss(config.gamma, weight_tensor,  config.label_smoothing,  config.reduction) 
             cls_type = "multiclass"
         else:
-            pos_weight_tensor = torch.tensor(self.pos_weights, dtype=torch.float32)
-            loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+            loss = MultiLabelFocalLoss(config.gamma, pos_weight_tensor,  weight_tensor, config.label_smoothing,  config.reduction) 
             cls_type = "multilabel"
         
         return loss, cls_type
