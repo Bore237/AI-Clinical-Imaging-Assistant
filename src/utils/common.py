@@ -78,16 +78,18 @@ Version:
     1.0.0
 """
 
+import io
 import os
 import yaml
 import pydicom
 import argparse
+import zipfile
 import numpy as np
 from pathlib import Path
 from box import ConfigBox 
 from tqdm.auto import tqdm
 from box.exceptions import BoxValueError
-from typing import List, Tuple, Union, Dict
+from typing import List, Tuple, Union, Dict, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from src.utils.logger import get_logger
@@ -153,45 +155,73 @@ def create_directories(path_to_directories: List[Union[str, Path]], verbose: boo
         if verbose:
             logger.info(f"Directory verified or created at destination: {path}")
 
+def process_dicom(
+    dicom_path: str, 
+    root_save: str, 
+    zip_path: Optional[str] = None
+) -> Tuple[str, bool, Optional[str]]:
+    """Reads a DICOM file from disk or a ZIP archive, processes it, and exports it as an NPZ.
 
-def process_dicom(dicom_file: str, root_save: str) -> Tuple[str, bool, Union[str, None]]:
-    """Reads a DICOM file, extracts its pixel array and metadata, and exports it as an NPZ archive.
-
-    This function operates as a standalone job executed within isolated worker processes. 
-    It parses the DICOM file structure, packages the image payload with its native bit depth 
-    into a key-value structure, and applies zipped compression before flushing to disk.
+    This function operates as a standalone job designed for parallel execution. It 
+    can parse standard filesystem files or extract files directly into memory from 
+    a ZIP archive without prior disk decompression. It extracts the pixel array, 
+    normalizes contrast for MONOCHROME1 images, and saves the payload with its 
+    native bit depth into a compressed `.npz` file. Internal subdirectories 
+    (e.g., 'train', 'test') found inside ZIP archives are automatically preserved.
 
     Args:
-        dicom_file (str): Full filesystem path to the target source DICOM file.
-        root_save (str): Target directory where the compressed `.npz` archive will be saved.
+        dicom_path (str): Local filesystem path to the DICOM file, or the internal 
+            archive path if processing from a ZIP (e.g., 'train/patient1/001.dcm').
+        root_save (str): Target directory where the compressed `.npz` archive 
+            will be saved.
+        zip_path (str, optional): Path to the source local ZIP archive if the target 
+            DICOM file is contained inside a zip. Defaults to None.
 
     Returns:
-        Tuple[str, bool, Union[str, None]]: A tuple containing execution metadata:
-
-            * **dicom_file** (str): The original filepath of the processed asset.
-            * **success** (bool): Execution status flag. True if saved successfully, False otherwise.
-            * **error_message** (str or None): String trace of the caught exception if failed, 
+        Tuple[str, bool, Optional[str]]: A tuple containing execution metadata:
+            * dicom_path (str): The processed filepath or internal archive path.
+            * success (bool): Execution status. True if successful, False otherwise.
+            * error_message (str or None): Error trace if an exception occurred, 
               otherwise None.
     """
     try:
-        ds = pydicom.dcmread(dicom_file)
+        if zip_path:
+            # Read DICOM bytes directly from the ZIP archive into RAM
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                file_bytes = z.read(dicom_path)
+            ds = pydicom.dcmread(io.BytesIO(file_bytes))
+            
+            # Retain the internal archive structure (e.g., 'train/patient1/001.npz')
+            relative_npz = os.path.splitext(dicom_path)[0] + ".npz"
+            save_path = os.path.join(root_save, relative_npz)
+        else:
+            # Read DICOM directly from the local filesystem
+            ds = pydicom.dcmread(dicom_path)
+            
+            # Standard behavior: flatten filename to the root save directory
+            base_name = os.path.splitext(os.path.basename(dicom_path))[0] + ".npz"
+            save_path = os.path.join(root_save, base_name)
 
-        # Extract the structural pixel data array and header bit information
+        # Extract and process pixel payload
+        arr = ds.pixel_array.astype(np.float32)
+
+        if getattr(ds, "PhotometricInterpretation", "") == "MONOCHROME1":
+            arr = np.amax(arr) - arr
+
         imgs = {
-            "img": ds.pixel_array.astype(np.float32),
+            "img": arr,
             "bitsStored": ds.BitsStored
         }
 
-        # Generate output filename by replacing the extension with .npz
-        base_name = os.path.splitext(os.path.basename(dicom_file))[0] + ".npz"
-        save_path = os.path.join(root_save, base_name)
+        # Dynamically create subdirectories if they don't exist yet
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        # Save dictionary to a compressed zip archive format
+        # Save to a compressed NPZ archive format
         np.savez_compressed(save_path, **imgs)
-        return dicom_file, True, None
+        return dicom_path, True, None
 
     except Exception as e:
-        return dicom_file, False, str(e)
+        return dicom_path, False, str(e)
 
 
 def process_single_image(img_path: str, ext: str, nonzero: bool = True) -> Tuple[float, float, int, bool]:
@@ -391,12 +421,22 @@ if __name__ == "__main__":
                 ext = '.' + ext
 
             os.makedirs(root_save, exist_ok=True)
-            
-            dicom_files = [
-                os.path.join(root_input, file) 
-                for file in os.listdir(root_input) 
-                if file.lower().endswith(ext.lower())
-            ]
+            is_zip = zipfile.is_zipfile(root_input)
+
+            if is_zip:
+                logger.info(f"Archive ZIP détectée : {root_input}")
+
+                with zipfile.ZipFile(root_input, 'r') as z:
+                    dicom_files = [
+                        name for name in z.namelist()
+                        if name.lower().endswith(ext.lower()) and not name.endswith('/')
+                    ]
+            else:
+                dicom_files = [
+                    os.path.join(root_input, file) 
+                    for file in os.listdir(root_input) 
+                    if file.lower().endswith(ext.lower())
+                ]
 
             if not dicom_files:
                 logger.info(f"No files matching extension '{ext}' were discovered inside: {root_input}")
@@ -408,7 +448,13 @@ if __name__ == "__main__":
             failed_jobs: List[Tuple[str, str]] = []
 
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(process_dicom, f, root_save) for f in dicom_files]
+                if is_zip:
+                    futures = [
+                            executor.submit(process_dicom, f, root_save, zip_path=root_input) 
+                            for f in dicom_files
+                    ]
+                else:
+                    futures = [executor.submit(process_dicom, f, root_save) for f in dicom_files]
 
                 for future in tqdm(as_completed(futures), total=len(futures), desc="Converting DICOMs"):
                     dicom_path, success, error_msg = future.result()
