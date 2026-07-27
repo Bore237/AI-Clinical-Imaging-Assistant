@@ -105,11 +105,27 @@ Version:
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Literal, Tuple, TypedDict, Union
+from typing import Dict, Literal, Tuple, TypedDict, Union, List, Optional
 from beartype import beartype
 
 
 # --- Structural Type Definitions (TypedDict) ---
+
+class LoadImage(TypedDict):
+    """Configuration for loading and preprocessing a medical image.
+
+    Attributes:
+        image_size: Target image size (H, W).
+        z_score: Whether to apply z-score normalization image per image.
+        mean: Mean value used for normalization. Ignored if ``z_score`` is False.
+        std: Standard deviation used for normalization. Ignored if ``z_score`` is False.
+        quantile: Lower and upper quantiles used for intensity clipping, e.g. [0.01, 0.99].
+    """
+    image_size: Tuple[int, int]
+    z_score: bool
+    mean:  Optional[float]
+    std: Optional[float]
+    quantile: List[float] | None
 
 class FlipConfig(TypedDict):
     """Configuration mapping for random spatial flipping transforms.
@@ -215,7 +231,7 @@ class ClsTransformationConfig:
     optimized for deep learning frameworks like MONAI.
 
     Attributes:
-        image_size (Tuple[int, ...]): Final dimension matrix target layout used during spatial scaling.
+        load_image (LoadImage): all information to load medical images.
         cache_rate (Tuple[float, float]): Caching capacity factor parameters matching [train, val] splits.
         cache_num_workers (int): Processing thread limits allotted to async memory caches.
         flip (FlipConfig): Structural configuration mapping for random spatial array flips.
@@ -223,7 +239,7 @@ class ClsTransformationConfig:
         gaussian_noise (GaussianConfig): Stochastic tracking configurations for noise addition.
         affine (AffineConfig): Geometric mapping details for spatial translations and rotations.
     """
-    image_size: Tuple[int, ...]
+    load_image: LoadImage
     cache_rate: Tuple[float, float]
     cache_num_workers: int
     flip: FlipConfig
@@ -262,3 +278,28 @@ class ClsModelConfig:
     num_classes: int
     pretrained: bool
     uuid_tag: str
+
+@beartype
+@dataclass(frozen=True)
+class LossConfig:
+    """Configuration of the loss function.
+
+    The loss implementation is selected automatically according to the
+    classification task (multiclass or multilabel).
+
+    Attributes:
+        gamma: Focusing parameter used by focal loss.
+        class_weight: Whether to apply class weights for multiclass training.
+        pos_weight: Whether to apply positive class weights for multilabel
+            training.
+        label_smoothing: Label smoothing factor. If ``None``, label smoothing
+            is disabled.
+        reduction: Reduction applied to the loss. One of ``"mean"``,
+            ``"sum"``, or ``"none"``.
+    """
+
+    gamma: float
+    class_weight: bool
+    pos_weight: bool
+    label_smoothing: float = 0.0
+    reduction: Literal["mean", "sum", "none"] = "mean"
