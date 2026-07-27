@@ -1,33 +1,39 @@
 data_ingestion:
-    ext: ".dicom"
+    ext: ".npz"
     csv_col:
         img: "image_id"
         label: "lesion_type"
-    path_root: "D:/marchine_learning/Projet/medical_project/AI-Clinical-Imaging-Assistant/data/vindr-spinexr"
+    path_root: "E:/sphine_xray_npz/vindr-spinexr/1.0.0" #"D:/marchine_learning/Projet/medical_project/AI-Clinical-Imaging-Assistant/data/vindr-spinexr"
     multiclass: false
     paths_img: ["train_images", "test_images"]
-    paths_csv: ["annotations/train.csv",  "annotations/test.csv" ]
-    samples_rate: [0.05, 0.02]
+    paths_csv: ["annotations/train.csv",  "annotations/test.csv"]
+    samples_rate: [0.01, 0.01]
     seed: 50
 
 data_transformation:
-    cache_num_workers: 2
-    image_size: [128, 128]
+    cache_num_workers: 4
+    load_image:
+        image_size: [128, 128]
+        z_score: true
+        mean: null
+        std: null 
+        quantile: [0.01, 0.99]
+
     cache_rate: [0.01, 0.01]
     flip:
         prob: 0.2
         axis: 1
     contrast:
-        prob: 0.3
-        gamma: [0.7, 1.3]
+        prob: 0.2
+        gamma: [0.8, 1.2]
     gaussian_noise:
         prob: 0.2
         std: 0.02
     affine:
-        prob: 0.5
-        rotate: 15.0
+        prob: 0.2
+        rotate: 30
         scale: [0.8, 1.2]
-        translate: [20, 20]
+        translate: [-15, 15]
         pad_mode: "border"
 
 loader:
@@ -65,10 +71,11 @@ trainer_config:
     compile_model: false
     
 losses:
-    loss_name: "BCE"
-    loss_param:
-        label_smoothing: 0.1
-        reduction: "mean"
+    gamma: 0.0
+    class_weight: false
+    pos_weight: True
+    label_smoothing: 0.1
+    reduction: "mean"
 
 optimizer:
     name: "AdamW"
