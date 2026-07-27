@@ -236,6 +236,12 @@ class ClsDataIngestion:
                 if file.endswith(self.config.ext.lower())
             ]
 
+            processed_count = len(raw_img_files)
+            if processed_count == 0:
+                error_msg = f"No files discovered with extension '{self.config.ext}' in: {img_dir_path}"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+
             # Execute localized random sampling slice based on config coefficients
             num_elements_to_keep = max(1, int(len(raw_img_files) * sample_rate))
             random.shuffle(raw_img_files)
@@ -245,6 +251,19 @@ class ClsDataIngestion:
             img_col = self.config.csv_col["img"]
             label_col = self.config.csv_col["label"]
             df_unique = df.drop_duplicates([img_col, label_col]).reset_index(drop=True)
+
+            disk_basenames = [os.path.splitext(os.path.basename(img_file))[0] for img_file in img_files[i]]
+            df_unique = df_unique[df_unique[img_col].astype(str).isin(disk_basenames)]
+
+            if df_unique.empty:
+                error_msg = (
+                    f"Data mapping resulted in 0 rows for split index {i}.\n"
+                    f"Check if the image IDs in your CSV column '{img_col}' match your disk filenames (minus extension).\n"
+                    f"Sample values from CSV: {list(df[img_col].head(3))}\n"
+                    f"Sample identifiers from Disk: {disk_basenames[:3]}"
+                )
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
 
             # Isolate distinct classes matching the current structural metadata
             if i == 0:
