@@ -121,6 +121,7 @@ class MultiLabelFocalLoss(nn.Module):
         self,
         gamma: float = 2.0,
         pos_weight: torch.Tensor | None = None,
+        class_weight: torch.Tensor | None = None,
         label_smoothing: float = 0.0,
         reduction: str = "mean"
     ):
@@ -128,6 +129,8 @@ class MultiLabelFocalLoss(nn.Module):
         self.gamma = gamma
         self.pos_weight = pos_weight
         self.label_smoothing = label_smoothing
+        self.class_weight = class_weight
+
         self.reduction = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -156,6 +159,7 @@ class MultiLabelFocalLoss(nn.Module):
             logits,
             smoothed_targets,
             pos_weight=self.pos_weight,
+            weight=self.class_weight,
             reduction="none"
         )
 
