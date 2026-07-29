@@ -1,9 +1,9 @@
 data_ingestion:
-    ext: ".npz"
+    ext: ".dicom"
     csv_col:
         img: "image_id"
         label: "lesion_type"
-    path_root: "E:/sphine_xray_npz/vindr-spinexr/1.0.0" #"D:/marchine_learning/Projet/medical_project/AI-Clinical-Imaging-Assistant/data/vindr-spinexr"
+    path_root: "D:/marchine_learning/Projet/medical_project/AI-Clinical-Imaging-Assistant/data/vindr-spinexr"
     multiclass: false
     paths_img: ["train_images", "test_images"]
     paths_csv: ["annotations/train.csv",  "annotations/test.csv"]
@@ -38,6 +38,7 @@ data_transformation:
 
 loader:
     batch_size: 4
+    display: true
     loader_params:
         num_workers: 4
         pin_memory: true
