@@ -106,6 +106,8 @@ Version:
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt 
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader
 from torchmetrics import MetricCollection
@@ -302,6 +304,21 @@ class TrainerManager:
         train_ds, valid_ds = cls_data_transformation.transforms(self.img_files, self.labels)
 
         loader_config = self.config_manager.get_loader_config()
+
+        if loader_config.display:
+            fig, ax = plt.subplots(nrows=2, ncols=2, figsize=(14, 10))
+            ax = ax.flatten()
+            for j in range(4):
+                i = np.random.randint(len(train_ds)-1)
+                data  = train_ds[i]
+                img = data['image']
+                label = data['label']
+                ax[j].imshow(img.squeeze(0).numpy(), cmap='gray')
+                ax[j].set_title(label)
+                ax[j].axis('off')
+                
+            plt.tight_layout()
+            plt.show()
         
         train_loader = DataLoader(
             train_ds, 

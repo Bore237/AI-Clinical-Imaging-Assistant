@@ -134,6 +134,7 @@ class LoaderConfig:
     """
 
     batch_size: int
+    display: bool
     loader_params: dict
 
 

@@ -282,6 +282,7 @@ class ConfigurationManager:
         """
         config = self.config.loader
         return LoaderConfig(
+            display=config.display,
             batch_size=config.batch_size,
             loader_params=config.loader_params
         )
