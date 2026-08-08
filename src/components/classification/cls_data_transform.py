@@ -1,48 +1,66 @@
 """
 Description:
-    Ce module orchestre le pipeline d'ingestion et de transformation de données pour la classification 
-    d'images médicales (ex: radiographies de la colonne vertébrale). Il encapsule le chargement 
-    haute performance de MONAI en séparant les opérations déterministes lourdes (mises en cache AOT) 
-    des augmentations stochastiques appliquées à la volée.
+    This module defines the data ingestion and preprocessing pipeline for medical
+    image classification (e.g., spine radiographs). It separates deterministic
+    preprocessing operations from stochastic data augmentations to leverage
+    MONAI's caching mechanism and improve training performance.
 
 Main components:
 
-    * XDataset: Sous-classe PyTorch (`Dataset`) exploitant le système `CacheDataset` de MONAI 
-      avec un mécanisme de repli récursif tolérant aux pannes.
-    * ClsDataTransformation: Gestionnaire et assembleur des chaînes de transformation (Compose) 
-      générant des instances prêtes pour les boucles d'entraînement et de validation.
+    * XDataset: PyTorch ``Dataset`` wrapper around MONAI's ``CacheDataset`` including a fault-tolerant fallback mechanism for corrupted samples.
+    * LoadResizeMedImg: Custom transform for loading, preprocessing, resizing and padding DICOM or NumPy medical images.
+    * ClsDataTransformation: Factory class assembling deterministic loading transforms and runtime augmentation pipelines.
 
 Main features:
 
-    * Accélération Ahead-Of-Time (AOT): Décodage, réalignement des canaux et redimensionnement 
-      exécutés une seule fois au démarrage, éliminant les goulots d'étranglement E/S du disque.
-    * Gestion Hybride des Cibles: Routage automatique des étiquettes selon le paradigme choisi 
-      (LongScalar pour le multi-classe, FloatVector pour le multi-label).
-    * Tolérance aux Pannes Robuste: En cas de fichier corrompu ou d'erreur de parsing au runtime, 
-      le chargeur capture l'exception et sélectionne aléatoirement un autre échantillon pour éviter 
-      l'interruption brutale du pipeline d'entraînement.
+    * Cached preprocessing: Image loading, intensity normalization, resizing, and padding are executed once during cache creation.
+    * Runtime augmentations: Random spatial and intensity transformations are applied only during training.
+    * Flexible normalization: Supports dataset-level normalization using fixed statistics or per-image z-score normalization.
+    * Robust loading: Automatically skips unreadable or corrupted samples by selecting another random sample instead of interrupting training.
+    * Multi-class and multi-label support: Automatically formats target tensors according to the selected classification task.
 
 General architecture:
-    La séparation stricte entre les transformations de chargement (`load_t`) et de runtime (`runtime_t`) 
-    permet d'optimiser l'utilisation de la mémoire RAM/NVMe :
-    [Chemins Disque] ➔ Ingestion MONAI ➔ Cache RAM (`CacheDataset`) ➔ Augmentations Stochastiques ➔ Batch Tensors
+    The pipeline separates deterministic preprocessing from stochastic
+    augmentations:
+
+        Disk files
+            │
+            ▼
+        LoadResizeMedImg
+            │
+            ▼
+        CacheDataset (cached)
+            │
+            ▼
+        Runtime augmentations
+            │
+            ▼
+        Model input
 
 General data flow:
 
     .. code-block:: text
 
-        [Boot Time]
-        Fichiers sur Disque ➔ LoadImage ➔ EnsureChannelFirst ➔ Ingestion Cache RAM (AOT)
-        
-        [Training Epochs / Runtime Loop]
-        Cache RAM ➔ [__getitem__(index)] ➔ RandFlip/RandAffine ➔ Normalisation Type ➔ Output Batch
+        [Initialization]
+        Disk Files
+            └── LoadResizeMedImg
+                    └── CacheDataset
 
-Optimisations:
+        [Training]
+        CacheDataset
+            └── RandFlip
+            └── RandAffine
+            └── RandAdjustContrast
+            └── RandGaussianNoise
+                    └── Batch tensors
 
-    * Multiprocessing AOT: La phase de mise en cache initiale exploite l'intégralité des cœurs 
-      processeurs disponibles via `os.cpu_count()`.
-    * Normalisation Ciblée: Utilisation des constantes globales `MEAN` et `STD` adaptées au domaine 
-      médical via `NormalizeIntensity` avec filtrage des intensités non nulles (`nonzero=True`).
+Optimizations:
+
+    * Multi-process caching: Cache initialization uses all available CPU cores.
+    * Cached deterministic transforms: Expensive preprocessing is executed only
+      once, reducing disk I/O during training.
+    * Efficient runtime pipeline: Only lightweight stochastic augmentations are
+      applied after samples have been cached.
 
 Example:
 
@@ -52,20 +70,32 @@ Example:
         from src.data.dataset import ClsDataTransformation
 
         config = ClsTransformationConfig(
-            image_size=(512, 512),
+            load_image={
+                "image_size": [128, 128]
+                "z_score": true
+                "mean": None
+                "std": None 
+                "quantile": [0.01, 0.99]
+            },
             cache_rate=(1.0, 0.0),
             flip={"prob": 0.5, "axis": 0},
-            affine={"prob": 0.7, "rotate": 4, "scale": (0.8, 1.2), "translate": (0.1, 0.1), "pad_mode": "reflection"},
+            affine={
+                "prob": 0.7,
+                "rotate": 36,
+                "scale": (0.8, 1.2),
+                "translate": (0.1, 0.1),
+                "pad_mode": "reflection",
+            },
             contrast={"prob": 0.3, "gamma": (0.5, 4.5)},
-            gaussian_noise={"prob": 0.2, "std": 0.1}
+            gaussian_noise={"prob": 0.2, "std": 0.1},
         )
-        
-        orchestrator = ClsDataTransformation(config=config, multiclass=True)
-        train_ds, val_ds = orchestrator.transforms(img_files=([path1, path2], [path3]), labels=(labels_train, labels_val))
+
+        transforms = ClsDataTransformation(config=config, multiclass=True)
+        train_ds, val_ds = transforms.transforms(img_files=([path1, path2], [path3]),  labels=(train_labels, val_labels))
 
 References:
-    * MONAI CacheDataset Architecture: https://docs.monai.io/
-    * PyTorch Data Loading Utility: https://pytorch.org/docs/stable/data.html
+    * MONAI documentation: https://docs.monai.io/
+    * PyTorch Dataset documentation: https://pytorch.org/docs/stable/data.html
 
 Author:
     Goudjou Borel
@@ -78,15 +108,13 @@ import os
 from typing import List, Tuple, Union, Any, Literal, Dict
 import numpy as np
 import torch
+import torch.nn.functional as F
 import monai.transforms as T
-from monai.data import CacheDataset  # pyright: ignore[reportPrivateImportUsage]
+from monai.data import CacheDataset 
 from torch.utils.data import Dataset
-
-# NOTE: MEAN and STD are imported here as fixed constants.
-from src.configs import MEAN, STD
+import pydicom
 from src.entity.cls_entity import ClsTransformationConfig
 from src.utils.logger import get_logger
-
 
 class XDataset(Dataset):
     """Custom Dataset for medical image classification using MONAI.
@@ -192,7 +220,108 @@ class XDataset(Dataset):
             alt_index = int(np.random.randint(0, len(self.img_files)))
             return self.__getitem__(alt_index)
 
+class LoadResizeMedImg:
+    """Load, preprocess, resize, and pad a medical image.
 
+    This transform supports DICOM (`.dcm`) and NumPy (`.npz`) image files.
+    Images are normalized to the range [0, 1] using their bit depth,
+    optionally intensity-clipped, normalized, resized while preserving the
+    aspect ratio, and zero- or minimum-padded to the target spatial size.
+
+    Args:
+        spatial_size: Target output size as ``(height, width)``.
+        z_score: If ``True``, apply z-score normalization using foreground
+            pixels only.
+        mean: Mean used for normalization when ``z_score`` is ``False``.
+        std: Standard deviation used for normalization when ``z_score`` is
+            ``False``.
+        quantile: Optional lower and upper quantiles (e.g., ``(0.01, 0.99)``)
+            used for intensity clipping on foreground pixels.
+
+    Returns:
+        torch.Tensor: Preprocessed image tensor of shape ``(C, H, W)``.
+    """
+    def __init__(self, spatial_size: tuple, z_score: bool = False, buffer_margin: int=32,
+                mean: float | None = None, std: float | None = None,  quantile=None):
+        
+        self.mean = None if mean is None else torch.tensor(mean, dtype=torch.float32)
+        self.std = None if std is None else torch.tensor(std, dtype=torch.float32)
+        self.z_score = z_score
+        self.spatial_size = spatial_size
+        self.buffered_size = (spatial_size[0] + 2*buffer_margin, spatial_size[1] + 2*buffer_margin)
+        self.quantile = quantile
+
+    def __call__(self, data):
+        data = str(data)
+
+        if data.endswith(".npz"): 
+            npz = np.load(data)
+            img = torch.from_numpy(npz["img"]).float()
+            img.div_(2**int(npz["bitsStored"]) - 1)
+        elif data.endswith(".dicom") or data.endswith(".dcm"):
+            dcm = pydicom.dcmread(data)
+            arr = dcm.pixel_array
+            if getattr(dcm, "PhotometricInterpretation", "") == "MONOCHROME1":
+                arr = np.amax(arr) - arr 
+
+            img = torch.from_numpy(arr).float()
+            bits = getattr(dcm, "BitsStored", arr.dtype.itemsize * 8)
+            img.div_(2 ** bits - 1)
+        else:
+            raise ValueError("This library only support dicom and npz extension")
+
+        # Foreground mask (ignore background pixels)
+        fg_mask = img > img.min() + 1e-3  
+        fg_vals = img[fg_mask]
+        # Optional intensity clipping
+        if self.quantile is not None:
+            sub_img = fg_vals.view(-1)[::16] 
+            p1, p99 = torch.quantile(sub_img, torch.tensor(self.quantile))
+            img.clamp_(p1, p99)
+
+        # Intensity normalization
+        if self.z_score:
+            mean = fg_vals.mean()
+            std = fg_vals.std()
+            img.sub_(mean).div_(std.clamp_min(1e-6))
+        else:
+            if self.mean is not None and self.std is not None:
+                img.sub_(self.mean).div_(self.std)
+
+        # Ensure channel-first format (C, H, W)
+        if img.ndim == 2:
+            img = img.unsqueeze(0)
+
+        # Compute isotropic resize factor
+        _, h, w = img.shape
+        target_h, target_w = self.spatial_size
+        scale = min(target_h / h, target_w / w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        img_resized = F.interpolate(img.unsqueeze(0), size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True).squeeze(0)
+
+        # Compute symmetric padding
+        buf_h, buf_w = self.buffered_size
+        pad_top = (buf_h - new_h) // 2
+        pad_bottom = (buf_h - new_h) - pad_top
+        pad_left = (buf_w - new_w) // 2
+        pad_right = (buf_w - new_w) - pad_left
+
+        pad_value = float(img_resized.amin())
+        img_padded = F.pad(img_resized, (pad_left, pad_right, pad_top, pad_bottom),mode="constant", value=pad_value)
+
+        return img_padded
+
+class CenterCropFinal(T.Transform):
+    def __init__(self, spatial_size: tuple = (512, 512)):
+        self.spatial_size = spatial_size
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        _, h, w = img.shape
+        target_h, target_w = self.spatial_size
+        top = (h - target_h) // 2
+        left = (w - target_w) // 2
+        return img[:, top:top+target_h, left:left+target_w]
+    
 class ClsDataTransformation:
     """Data transformation pipeline manager for medical image classification tasks.
 
@@ -232,12 +361,14 @@ class ClsDataTransformation:
         and resolution scaling onto the system persistence cache layer, leaving light stochastic affine 
         and intensity alterations to process at execution runtimes.
         """
-        # Initial loading pipeline (Perfect candidate for caching)
+        # Initial loading pipeline
         self.load_transform = T.Compose([  
-            T.LoadImage(),  
-            T.EnsureChannelFirst(),  
-            T.NormalizeIntensity(subtrahend=MEAN, divisor=STD, nonzero=True),  # type: ignore
-            T.Resize(spatial_size=self.config.image_size),  
+            LoadResizeMedImg(spatial_size=self.config.load_image["image_size"],
+                            z_score=self.config.load_image["z_score"], 
+                            mean=self.config.load_image["mean"],
+                            std=self.config.load_image["std"],  
+                            buffer_margin=self.config.load_image['buffer_margin'],
+                            quantile=self.config.load_image["quantile"])
         ])
 
         # Data Augmentation pipeline (Executed on-the-fly during training steps)
@@ -251,7 +382,6 @@ class ClsDataTransformation:
                 rotate_range=(-np.pi / self.config.affine["rotate"], np.pi / self.config.affine["rotate"]), 
                 scale_range=self.config.affine["scale"], 
                 translate_range=self.config.affine["translate"],     
-                spatial_size=self.config.image_size, 
                 padding_mode=self.config.affine["pad_mode"]
             ),
             T.RandAdjustContrast(
@@ -262,12 +392,14 @@ class ClsDataTransformation:
                 prob=self.config.gaussian_noise["prob"], 
                 mean=0.0, 
                 std=self.config.gaussian_noise["std"]
-            ),  
+            ),
+
+            CenterCropFinal(spatial_size=self.config.load_image["image_size"])
         ])
 
         # Validation / Test pipeline (No augmentations, standard type casting)
         self.val_transforms = T.Compose([
-            T.EnsureType(data_type="tensor", dtype=torch.float32)
+            CenterCropFinal(spatial_size=self.config.load_image["image_size"])
         ])  
 
     def transforms(

@@ -106,6 +106,8 @@ Version:
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt 
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader
 from torchmetrics import MetricCollection
@@ -121,7 +123,11 @@ from typing import Any, Tuple, Iterable
 from src.components.classification.cls_data_ingestion import ClsDataIngestion
 from src.components.classification.cls_data_transform import ClsDataTransformation
 from src.configs.classification.cls_config import ConfigurationManager
+from src.utils.cls_losses import MultiClassFocalLoss, MultiLabelFocalLoss, AsymmetricLoss
 
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 class TrainerManager:
     """A factory engine that builds and configures PyTorch components for training loops.
@@ -165,27 +171,51 @@ class TrainerManager:
         self.class_label = {k: idx for idx, k in enumerate(self.weights.keys())}
 
     def get_loss(self) -> Tuple[nn.Module, str]:
-        """Resolves the objective loss function based on the active classification style.
+        """Create the focal loss function for the current classification task.
 
-        For Multiclass targets, builds an instance of ``nn.CrossEntropyLoss`` integrated 
-        with a categorical tensor tracking inverse frequencies and an explicit label smoothing 
-        factor (:math:`0.1`) to prevent overconfident boundary updates. For Multilabel targets, 
-        builds an instance of ``nn.BCEWithLogitsLoss`` embedding custom calculated positive 
-        class multipliers to balance unaligned label distributions.
+        Returns one a ``MultiClassFocalLoss`` or a ``MultiLabelFocalLoss | AsymmetricLoss`` 
+        depending on whether the task is multiclass or multilabel. Optional
+        class and positive class weights are applied according to the configuration.
 
         Returns:
             Tuple[nn.Module, str]: A tuple containing:
 
-                * **loss** (*nn.Module*): The un-placed loss module ready for deployment to devices.
-                * **cls_type** (*str*): Identification signature tracking the pipeline configuration (``"multiclass"`` or ``"multilabel"``).
+                * **loss** (*nn.Module*): Instantiated ``MultiClassFocalLoss`` or ``MultiLabelFocalLoss | AsymmetricLoss``.
+                * **cls_type** (*str*): Classification type, either ``"multiclass"`` or ``"multilabel"``.
         """
+        config = self.config_manager.get_loss_config()
+
+        weight_tensor = (torch.tensor(list(self.weights.values()), dtype=torch.float32) if config.class_weight else None)
+
+        pos_weight_tensor = (torch.tensor(self.pos_weights, dtype=torch.float32) if config.pos_weight  else None)
+
         if self.multiclass:
-            weight_tensor = torch.tensor(list(self.weights.values()), dtype=torch.float32)
-            loss = nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=0.1)
+            loss = MultiClassFocalLoss(gamma=config.gamma, class_weight=weight_tensor, 
+                                    label_smoothing=config.label_smoothing,  reduction=config.reduction) 
+
+            logger.info(
+                f"Configured MultiClassFocalLoss (gamma={config.gamma}, "
+                f"label_smoothing={config.label_smoothing}, reduction='{config.reduction}', "
+                f"weighted={config.class_weight})"
+            )
             cls_type = "multiclass"
         else:
-            pos_weight_tensor = torch.tensor(self.pos_weights, dtype=torch.float32)
-            loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+            if config.asymetric_param is not None:
+                loss = AsymmetricLoss(transform_weight=config.transform_pos_weight, pos_weight=pos_weight_tensor, 
+                                    reduction=config.reduction, **config.asymetric_param)
+
+                logger.info(
+                    f"Configured AsymmetricLoss for multilabel task "
+                    f"(params={config.asymetric_param}, pos_weighted={config.pos_weight})"
+                )
+            else:
+                loss = MultiLabelFocalLoss(gamma=config.gamma, pos_weight=pos_weight_tensor,  class_weight=weight_tensor, 
+                                        label_smoothing=config.label_smoothing,  reduction=config.reduction) 
+                logger.info(
+                    f"Configured MultiLabelFocalLoss (gamma={config.gamma}, "
+                    f"label_smoothing={config.label_smoothing}, reduction='{config.reduction}', "
+                    f"pos_weighted={config.pos_weight})"
+                )
             cls_type = "multilabel"
         
         return loss, cls_type
@@ -205,8 +235,11 @@ class TrainerManager:
         """
         opt_config = self.config_manager.get_optimizer_config() 
         opt_class = getattr(optim, opt_config.name)
-        
-        return opt_class(params=model_parameters, **opt_config.optimizer_params)
+
+        optimizer = opt_class(params=model_parameters, **opt_config.optimizer_params)
+        logger.info(f"Initialized optimizer '{opt_config.name}' with params: {opt_config.optimizer_params}")
+
+        return optimizer
 
     def get_scheduler(self, optimizer: optim.Optimizer) -> Any:
         r"""Constructs the learning rate scheduler pipeline, incorporating optional warmup logic.
@@ -243,12 +276,18 @@ class TrainerManager:
                 params["T_max"] = max(1, params["T_max"] - warmup_epochs)
                 
             main_sched = sched_class(optimizer=optimizer, **params)
+            logger.info(
+                f"Constructed composite SequentialLR pipeline: {warmup_epochs}-epoch linear warmup "
+                f"followed by {sched_config.name} (adjusted params={params})."
+            )
+
             return lr_scheduler.SequentialLR(
                 optimizer,
                 schedulers=[warmup_sched, main_sched],
                 milestones=[warmup_epochs]
             )
         else:
+            logger.info(f"Initialized standalone scheduler '{sched_config.name}' with params: {sched_config.scheduler_params}")
             return sched_class(optimizer=optimizer, **sched_config.scheduler_params)
 
     def get_evaluation_metrics(self) -> MetricCollection:
@@ -296,6 +335,21 @@ class TrainerManager:
         train_ds, valid_ds = cls_data_transformation.transforms(self.img_files, self.labels)
 
         loader_config = self.config_manager.get_loader_config()
+
+        if loader_config.display:
+            fig, ax = plt.subplots(nrows=2, ncols=2, figsize=(14, 10))
+            ax = ax.flatten()
+            for j in range(4):
+                i = np.random.randint(len(train_ds)-1)
+                data  = train_ds[i]
+                img = data['image']
+                label = data['label']
+                ax[j].imshow(img.squeeze(0).numpy(), cmap='gray')
+                ax[j].set_title(label)
+                ax[j].axis('off')
+                
+            plt.tight_layout()
+            plt.show()
         
         train_loader = DataLoader(
             train_ds, 

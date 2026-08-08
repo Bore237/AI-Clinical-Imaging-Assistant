@@ -102,6 +102,7 @@ from src.entity.cls_entity import (
     ClsDataIngestionConfig,
     ClsModelConfig,
     ClsTransformationConfig,
+    LossConfig
 )
 from src.entity.train_entity import (
     EarlyStoppingConfig,
@@ -190,7 +191,7 @@ class ConfigurationManager:
         """
         config = self.config.data_transformation
         return ClsTransformationConfig(
-            image_size=tuple(config.image_size),
+            load_image=config.load_image,
             cache_rate=tuple(config.cache_rate),
             cache_num_workers=config.cache_num_workers,
             flip=config.flip,
@@ -281,6 +282,7 @@ class ConfigurationManager:
         """
         config = self.config.loader
         return LoaderConfig(
+            display=config.display,
             batch_size=config.batch_size,
             loader_params=config.loader_params
         )
@@ -309,4 +311,24 @@ class ConfigurationManager:
             name=config.name,
             warmup_epochs=config.warmup_epochs,
             scheduler_params=config.scheduler_params
+        )
+
+    def get_loss_config(self) -> LossConfig:
+        """Build the loss configuration.
+
+        Reads the loss-related settings from the parsed configuration file and
+        returns them as a :class:`LossConfig` instance.
+
+        Returns:
+            LossConfig: Loss configuration.
+        """
+        config = self.config.losses
+        return LossConfig(
+            asymetric_param=config.asymetric_param,
+            gamma=config.gamma,
+            class_weight=config.class_weight,
+            pos_weight=config.pos_weight,
+            label_smoothing=config.label_smoothing or 0.0,
+            transform_pos_weight=config.transform_pos_weight or 'log',
+            reduction=config.reduction or "mean"
         )
