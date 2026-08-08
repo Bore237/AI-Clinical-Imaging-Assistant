@@ -123,9 +123,23 @@ class LoadImage(TypedDict):
     """
     image_size: Tuple[int, int]
     z_score: bool
+    buffer_margin: int
     mean:  Optional[float]
     std: Optional[float]
     quantile: List[float] | None
+
+class AsymetricLossParam(TypedDict):
+    """Configuration parameters for the asymmetric loss. 
+    
+    Attributes: 
+        gamma_pos: Focusing parameter for positive samples. 
+        gamma_neg: Focusing parameter for negative samples. 
+        clip: Clipping value applied to negative probabilities. 
+    """
+    
+    gamma_pos: float
+    gamma_neg: float
+    clip: float
 
 class FlipConfig(TypedDict):
     """Configuration mapping for random spatial flipping transforms.
@@ -297,9 +311,10 @@ class LossConfig:
         reduction: Reduction applied to the loss. One of ``"mean"``,
             ``"sum"``, or ``"none"``.
     """
-
+    asymetric_param: None | AsymetricLossParam
     gamma: float
     class_weight: bool
     pos_weight: bool
     label_smoothing: float = 0.0
+    transform_pos_weight: Literal["log", "sqrt", "none"] = "log"
     reduction: Literal["mean", "sum", "none"] = "mean"

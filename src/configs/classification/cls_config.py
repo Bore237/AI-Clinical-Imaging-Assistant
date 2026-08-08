@@ -324,9 +324,11 @@ class ConfigurationManager:
         """
         config = self.config.losses
         return LossConfig(
+            asymetric_param=config.asymetric_param,
             gamma=config.gamma,
             class_weight=config.class_weight,
             pos_weight=config.pos_weight,
             label_smoothing=config.label_smoothing or 0.0,
+            transform_pos_weight=config.transform_pos_weight or 'log',
             reduction=config.reduction or "mean"
         )
