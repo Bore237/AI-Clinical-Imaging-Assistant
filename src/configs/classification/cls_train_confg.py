@@ -123,8 +123,11 @@ from typing import Any, Tuple, Iterable
 from src.components.classification.cls_data_ingestion import ClsDataIngestion
 from src.components.classification.cls_data_transform import ClsDataTransformation
 from src.configs.classification.cls_config import ConfigurationManager
-from src.utils.cls_losses import MultiClassFocalLoss, MultiLabelFocalLoss
+from src.utils.cls_losses import MultiClassFocalLoss, MultiLabelFocalLoss, AsymmetricLoss
 
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 class TrainerManager:
     """A factory engine that builds and configures PyTorch components for training loops.
@@ -170,18 +173,15 @@ class TrainerManager:
     def get_loss(self) -> Tuple[nn.Module, str]:
         """Create the focal loss function for the current classification task.
 
-        Returns either a ``MultiClassFocalLoss`` or a ``MultiLabelFocalLoss``
+        Returns one a ``MultiClassFocalLoss`` or a ``MultiLabelFocalLoss | AsymmetricLoss`` 
         depending on whether the task is multiclass or multilabel. Optional
-        class and positive class weights are applied according to the
-        configuration.
+        class and positive class weights are applied according to the configuration.
 
         Returns:
             Tuple[nn.Module, str]: A tuple containing:
 
-                * **loss** (*nn.Module*): Instantiated ``MultiClassFocalLoss`` or
-                ``MultiLabelFocalLoss``.
-                * **cls_type** (*str*): Classification type, either
-                ``"multiclass"`` or ``"multilabel"``.
+                * **loss** (*nn.Module*): Instantiated ``MultiClassFocalLoss`` or ``MultiLabelFocalLoss | AsymmetricLoss``.
+                * **cls_type** (*str*): Classification type, either ``"multiclass"`` or ``"multilabel"``.
         """
         config = self.config_manager.get_loss_config()
 
@@ -190,10 +190,32 @@ class TrainerManager:
         pos_weight_tensor = (torch.tensor(self.pos_weights, dtype=torch.float32) if config.pos_weight  else None)
 
         if self.multiclass:
-            loss = MultiClassFocalLoss(config.gamma, weight_tensor,  config.label_smoothing,  config.reduction) 
+            loss = MultiClassFocalLoss(gamma=config.gamma, class_weight=weight_tensor, 
+                                    label_smoothing=config.label_smoothing,  reduction=config.reduction) 
+
+            logger.info(
+                f"Configured MultiClassFocalLoss (gamma={config.gamma}, "
+                f"label_smoothing={config.label_smoothing}, reduction='{config.reduction}', "
+                f"weighted={config.class_weight})"
+            )
             cls_type = "multiclass"
         else:
-            loss = MultiLabelFocalLoss(config.gamma, pos_weight_tensor,  weight_tensor, config.label_smoothing,  config.reduction) 
+            if config.asymetric_param is not None:
+                loss = AsymmetricLoss(transform_weight=config.transform_pos_weight, pos_weight=pos_weight_tensor, 
+                                    reduction=config.reduction, **config.asymetric_param)
+
+                logger.info(
+                    f"Configured AsymmetricLoss for multilabel task "
+                    f"(params={config.asymetric_param}, pos_weighted={config.pos_weight})"
+                )
+            else:
+                loss = MultiLabelFocalLoss(gamma=config.gamma, pos_weight=pos_weight_tensor,  class_weight=weight_tensor, 
+                                        label_smoothing=config.label_smoothing,  reduction=config.reduction) 
+                logger.info(
+                    f"Configured MultiLabelFocalLoss (gamma={config.gamma}, "
+                    f"label_smoothing={config.label_smoothing}, reduction='{config.reduction}', "
+                    f"pos_weighted={config.pos_weight})"
+                )
             cls_type = "multilabel"
         
         return loss, cls_type
@@ -213,8 +235,11 @@ class TrainerManager:
         """
         opt_config = self.config_manager.get_optimizer_config() 
         opt_class = getattr(optim, opt_config.name)
-        
-        return opt_class(params=model_parameters, **opt_config.optimizer_params)
+
+        optimizer = opt_class(params=model_parameters, **opt_config.optimizer_params)
+        logger.info(f"Initialized optimizer '{opt_config.name}' with params: {opt_config.optimizer_params}")
+
+        return optimizer
 
     def get_scheduler(self, optimizer: optim.Optimizer) -> Any:
         r"""Constructs the learning rate scheduler pipeline, incorporating optional warmup logic.
@@ -251,12 +276,18 @@ class TrainerManager:
                 params["T_max"] = max(1, params["T_max"] - warmup_epochs)
                 
             main_sched = sched_class(optimizer=optimizer, **params)
+            logger.info(
+                f"Constructed composite SequentialLR pipeline: {warmup_epochs}-epoch linear warmup "
+                f"followed by {sched_config.name} (adjusted params={params})."
+            )
+
             return lr_scheduler.SequentialLR(
                 optimizer,
                 schedulers=[warmup_sched, main_sched],
                 milestones=[warmup_epochs]
             )
         else:
+            logger.info(f"Initialized standalone scheduler '{sched_config.name}' with params: {sched_config.scheduler_params}")
             return sched_class(optimizer=optimizer, **sched_config.scheduler_params)
 
     def get_evaluation_metrics(self) -> MetricCollection:
