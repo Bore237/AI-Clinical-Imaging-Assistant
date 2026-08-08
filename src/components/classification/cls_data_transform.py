@@ -113,12 +113,8 @@ import monai.transforms as T
 from monai.data import CacheDataset 
 from torch.utils.data import Dataset
 import pydicom
-
-# NOTE: MEAN and STD are imported here as fixed constants.
-from src.configs import MEAN, STD
 from src.entity.cls_entity import ClsTransformationConfig
 from src.utils.logger import get_logger
-
 
 class XDataset(Dataset):
     """Custom Dataset for medical image classification using MONAI.
@@ -245,11 +241,14 @@ class LoadResizeMedImg:
     Returns:
         torch.Tensor: Preprocessed image tensor of shape ``(C, H, W)``.
     """
-    def __init__(self, spatial_size: tuple, z_score: bool = False, mean: float | None = None, std: float | None = None,  quantile=None):
+    def __init__(self, spatial_size: tuple, z_score: bool = False, buffer_margin: int=32,
+                mean: float | None = None, std: float | None = None,  quantile=None):
+        
         self.mean = None if mean is None else torch.tensor(mean, dtype=torch.float32)
         self.std = None if std is None else torch.tensor(std, dtype=torch.float32)
         self.z_score = z_score
         self.spatial_size = spatial_size
+        self.buffered_size = (spatial_size[0] + 2*buffer_margin, spatial_size[1] + 2*buffer_margin)
         self.quantile = quantile
 
     def __call__(self, data):
@@ -273,16 +272,17 @@ class LoadResizeMedImg:
 
         # Foreground mask (ignore background pixels)
         fg_mask = img > img.min() + 1e-3  
-
+        fg_vals = img[fg_mask]
         # Optional intensity clipping
         if self.quantile is not None:
-            p1, p99 = torch.quantile(img[fg_mask], torch.tensor(self.quantile))
+            sub_img = fg_vals.view(-1)[::16] 
+            p1, p99 = torch.quantile(sub_img, torch.tensor(self.quantile))
             img.clamp_(p1, p99)
 
         # Intensity normalization
         if self.z_score:
-            mean = img[fg_mask].mean()
-            std = img[fg_mask].std()
+            mean = fg_vals.mean()
+            std = fg_vals.std()
             img.sub_(mean).div_(std.clamp_min(1e-6))
         else:
             if self.mean is not None and self.std is not None:
@@ -297,26 +297,31 @@ class LoadResizeMedImg:
         target_h, target_w = self.spatial_size
         scale = min(target_h / h, target_w / w)
         new_h, new_w = int(h * scale), int(w * scale)
-
-        # Resize while preserving aspect ratio
         img_resized = F.interpolate(img.unsqueeze(0), size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True).squeeze(0)
 
         # Compute symmetric padding
-        pad_h = target_h - new_h
-        pad_w = target_w - new_w
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
+        buf_h, buf_w = self.buffered_size
+        pad_top = (buf_h - new_h) // 2
+        pad_bottom = (buf_h - new_h) - pad_top
+        pad_left = (buf_w - new_w) // 2
+        pad_right = (buf_w - new_w) - pad_left
 
-        if self.z_score or (self.mean is not None and self.std is not None):
-            pad_value = float(img_resized.amin())
-            img_padded = F.pad(img_resized, (pad_left, pad_right, pad_top, pad_bottom),mode="constant", value=pad_value)
-        else:
-            img_padded = F.pad(img_resized, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0)
-            
+        pad_value = float(img_resized.amin())
+        img_padded = F.pad(img_resized, (pad_left, pad_right, pad_top, pad_bottom),mode="constant", value=pad_value)
+
         return img_padded
 
+class CenterCropFinal(T.Transform):
+    def __init__(self, spatial_size: tuple = (512, 512)):
+        self.spatial_size = spatial_size
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        _, h, w = img.shape
+        target_h, target_w = self.spatial_size
+        top = (h - target_h) // 2
+        left = (w - target_w) // 2
+        return img[:, top:top+target_h, left:left+target_w]
+    
 class ClsDataTransformation:
     """Data transformation pipeline manager for medical image classification tasks.
 
@@ -362,6 +367,7 @@ class ClsDataTransformation:
                             z_score=self.config.load_image["z_score"], 
                             mean=self.config.load_image["mean"],
                             std=self.config.load_image["std"],  
+                            buffer_margin=self.config.load_image['buffer_margin'],
                             quantile=self.config.load_image["quantile"])
         ])
 
@@ -386,12 +392,14 @@ class ClsDataTransformation:
                 prob=self.config.gaussian_noise["prob"], 
                 mean=0.0, 
                 std=self.config.gaussian_noise["std"]
-            ),  
+            ),
+
+            CenterCropFinal(spatial_size=self.config.load_image["image_size"])
         ])
 
         # Validation / Test pipeline (No augmentations, standard type casting)
         self.val_transforms = T.Compose([
-            T.Identity()
+            CenterCropFinal(spatial_size=self.config.load_image["image_size"])
         ])  
 
     def transforms(
